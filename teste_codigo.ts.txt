@@ -1,0 +1,270 @@
+// src/main.ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { ValidationPipe } from '@nestjs/common';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  
+  // Configuração global de validação de DTOs
+  app.useGlobalPipes(new ValidationPipe({ transform: true }));
+  
+  // Configuração do Swagger
+  const config = new DocumentBuilder()
+    .setTitle('Golden Raspberry Awards API')
+    .setDescription('API para consulta dos piores filmes do Golden Raspberry Awards')
+    .setVersion('1.0')
+    .build();
+  const document = SwaggerModule.createDocument(app, config);
+  SwaggerModule.setup('api', app, document);
+  
+  await app.listen(3000);
+}
+bootstrap();
+
+// src/app.module.ts
+import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { MoviesModule } from './movies/movies.module';
+import { ConfigModule } from '@nestjs/config';
+import databaseConfig from './config/database.config';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      load: [databaseConfig],
+    }),
+    TypeOrmModule.forRootAsync({
+      useFactory: () => ({
+        type: 'h2',
+        database: ':memory:',
+        entities: [__dirname + '/**/*.entity{.ts,.js}'],
+        synchronize: true,
+        autoLoadEntities: true,
+      }),
+    }),
+    MoviesModule,
+  ],
+})
+export class AppModule {}
+
+// src/config/database.config.ts
+import { registerAs } from '@nestjs/config';
+
+export default registerAs('database', () => ({
+  type: 'h2',
+  database: ':memory:',
+  entities: [__dirname + '/../**/*.entity{.ts,.js}'],
+  synchronize: true,
+}));
+
+// src/movies/entities/movie.entity.ts
+import { Entity, Column, PrimaryGeneratedColumn } from 'typeorm';
+
+@Entity()
+export class Movie {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  year: number;
+
+  @Column()
+  title: string;
+
+  @Column()
+  studios: string;
+
+  @Column()
+  producers: string;
+
+  @Column({ default: false })
+  winner: boolean;
+}
+
+// src/movies/dtos/producer-interval.dto.ts
+import { ApiProperty } from '@nestjs/swagger';
+
+export class ProducerIntervalDto {
+  @ApiProperty()
+  producer: string;
+
+  @ApiProperty()
+  interval: number;
+
+  @ApiProperty()
+  previousWin: number;
+
+  @ApiProperty()
+  followingWin: number;
+}
+
+export class ProducerAwardsIntervalDto {
+  @ApiProperty({ type: [ProducerIntervalDto] })
+  min: ProducerIntervalDto[];
+
+  @ApiProperty({ type: [ProducerIntervalDto] })
+  max: ProducerIntervalDto[];
+}
+
+// src/movies/movies.module.ts
+import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { MoviesController } from './movies.controller';
+import { MoviesService } from './movies.service';
+import { Movie } from './entities/movie.entity';
+import { CsvLoaderService } from '../shared/services/csv-loader.service';
+
+@Module({
+  imports: [
+    TypeOrmModule.forFeature([Movie]),
+  ],
+  controllers: [MoviesController],
+  providers: [MoviesService, CsvLoaderService],
+})
+export class MoviesModule {}
+
+// src/movies/movies.controller.ts
+import { Controller, Get } from '@nestjs/common';
+import { MoviesService } from './movies.service';
+import { ProducerAwardsIntervalDto } from './dtos/producer-interval.dto';
+import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+
+@ApiTags('movies')
+@Controller('movies')
+export class MoviesController {
+  constructor(private readonly moviesService: MoviesService) {}
+
+  @Get('awards-interval')
+  @ApiOperation({ summary: 'Obter o intervalo de premiações dos produtores' })
+  @ApiResponse({ 
+    status: 200, 
+    description: 'Retorna os produtores com maior e menor intervalo entre vitórias', 
+    type: ProducerAwardsIntervalDto 
+  })
+  async getAwardsInterval(): Promise<ProducerAwardsIntervalDto> {
+    return this.moviesService.getProducerAwardsInterval();
+  }
+}
+
+// src/movies/movies.service.ts
+import { Injectable, OnModuleInit } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Movie } from './entities/movie.entity';
+import { CsvLoaderService } from '../shared/services/csv-loader.service';
+import { ProducerAwardsIntervalDto, ProducerIntervalDto } from './dtos/producer-interval.dto';
+
+@Injectable()
+export class MoviesService implements OnModuleInit {
+  constructor(
+    @InjectRepository(Movie)
+    private readonly movieRepository: Repository<Movie>,
+    private readonly csvLoaderService: CsvLoaderService,
+  ) {}
+
+  async onModuleInit() {
+    await this.loadMoviesFromCsv();
+  }
+
+  private async loadMoviesFromCsv() {
+    const movies = await this.csvLoaderService.loadMoviesFromCsv();
+    await this.movieRepository.save(movies);
+  }
+
+  async getProducerAwardsInterval(): Promise<ProducerAwardsIntervalDto> {
+    // Buscar apenas filmes vencedores
+    const winners = await this.movieRepository.find({ 
+      where: { winner: true },
+      order: { year: 'ASC' }
+    });
+    
+    // Mapear produtores e seus anos de vitória
+    const producerWins = new Map<string, number[]>();
+    
+    winners.forEach(movie => {
+      // Tratar múltiplos produtores separados por vírgula ou 'and'
+      const producers = movie.producers
+        .split(/\s+(?:and|,)\s+/)
+        .map(producer => producer.trim())
+        .filter(producer => producer);
+        
+      producers.forEach(producer => {
+        if (!producerWins.has(producer)) {
+          producerWins.set(producer, []);
+        }
+        producerWins.get(producer).push(movie.year);
+      });
+    });
+    
+    // Calcular intervalos
+    const intervals: ProducerIntervalDto[] = [];
+    
+    producerWins.forEach((years, producer) => {
+      // Precisamos de pelo menos 2 vitórias para calcular um intervalo
+      if (years.length >= 2) {
+        for (let i = 1; i < years.length; i++) {
+          intervals.push({
+            producer,
+            interval: years[i] - years[i-1],
+            previousWin: years[i-1],
+            followingWin: years[i]
+          });
+        }
+      }
+    });
+    
+    // Ordenar por intervalo
+    intervals.sort((a, b) => a.interval - b.interval);
+    
+    // Encontrar intervalos mínimos e máximos
+    const minInterval = intervals.length > 0 ? intervals[0].interval : 0;
+    const maxInterval = intervals.length > 0 ? intervals[intervals.length - 1].interval : 0;
+    
+    const result: ProducerAwardsIntervalDto = {
+      min: intervals.filter(item => item.interval === minInterval),
+      max: intervals.filter(item => item.interval === maxInterval)
+    };
+    
+    return result;
+  }
+}
+
+// src/shared/services/csv-loader.service.ts
+import { Injectable } from '@nestjs/common';
+import { readFile } from 'fs/promises';
+import { parse } from 'csv-parse/sync';
+import { Movie } from '../../movies/entities/movie.entity';
+import * as path from 'path';
+
+@Injectable()
+export class CsvLoaderService {
+  async loadMoviesFromCsv(): Promise<Movie[]> {
+    try {
+      // Caminho para o arquivo CSV (ajuste conforme necessário)
+      const csvFilePath = path.resolve(process.cwd(), 'data', 'movielist.csv');
+      const fileContent = await readFile(csvFilePath, 'utf-8');
+      
+      // Parsear CSV
+      const records = parse(fileContent, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+      });
+      
+      // Mapear registros para entidades Movie
+      return records.map(record => ({
+        year: parseInt(record.year, 10),
+        title: record.title,
+        studios: record.studios,
+        producers: record.producers,
+        winner: record.winner?.toLowerCase() === 'yes',
+      }));
+    } catch (error) {
+      console.error('Erro ao carregar arquivo CSV:', error);
+      throw error;
+    }
+  }
+}
